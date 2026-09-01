@@ -24,3 +24,9 @@ add_library(il STATIC
   src/wal.cpp
 )
 target_include_directories(il PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+enable_testing()
+
+add_executable(unit_tests tests/unit_tests.cpp)
+target_link_libraries(unit_tests PRIVATE il)
+add_test(NAME unit_tests COMMAND unit_tests)
