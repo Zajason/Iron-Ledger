@@ -21,5 +21,6 @@ endif()
 add_library(il STATIC
   src/crc32c.cpp
   src/device.cpp
+  src/wal.cpp
 )
 target_include_directories(il PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
