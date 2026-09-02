@@ -17,6 +17,7 @@
 
 #include "il/crc32c.h"
 #include "il/device.h"
+#include "il/ledger.h"
 #include "il/wal.h"
 
 // ---------------------------------------------------------------------------
@@ -554,6 +555,124 @@ TEST(wal_recovers_from_simulated_power_cut) {
 }
 
 // ---------------------------------------------------------------------------
+
+
+// ---------------------------------------------------------------------------
+// Step 1: transfer wire format
+// ---------------------------------------------------------------------------
+
+namespace {
+
+Transfer MakeTransfer(uint64_t key, std::vector<Posting> postings) {
+  Transfer t;
+  t.idem_key = key;
+  t.postings = std::move(postings);
+  return t;
+}
+
+}  // namespace
+
+TEST(transfer_wire_round_trip) {
+  // Every legal posting count, including the boundaries.
+  for (size_t n = kMinPostings; n <= kMaxPostings; ++n) {
+    std::vector<Posting> ps;
+    int64_t running = 0;
+    for (size_t i = 0; i + 1 < n; ++i) {
+      const int64_t amt = static_cast<int64_t>(100 + i);
+      ps.push_back({i + 1, amt});
+      running += amt;
+    }
+    ps.push_back({999, -running});  // balancing leg
+
+    const Transfer in = MakeTransfer(7000 + n, ps);
+    std::vector<uint8_t> buf;
+    EncodeTransfer(buf, in);
+    CHECK_EQ(buf.size(), 12u + 16u * n);
+
+    Transfer out;
+    CHECK(DecodeTransfer(buf.data(), static_cast<uint32_t>(buf.size()), &out));
+    CHECK_EQ(out.idem_key, in.idem_key);
+    CHECK_EQ(out.postings.size(), in.postings.size());
+    for (size_t i = 0; i < n; ++i) {
+      CHECK_EQ(out.postings[i].account, in.postings[i].account);
+      CHECK_EQ(out.postings[i].amount, in.postings[i].amount);
+    }
+  }
+}
+
+TEST(transfer_wire_preserves_negative_amounts) {
+  // Two's complement round-trip through the unsigned wire field, including the
+  // extremes where a sloppy cast would go wrong.
+  const std::vector<int64_t> amounts = {
+      -1, -1000, INT64_MIN + 1, INT64_MAX, 0,
+  };
+  for (int64_t a : amounts) {
+    const Transfer in = MakeTransfer(1, {{1, a}, {2, 0}});
+    std::vector<uint8_t> buf;
+    EncodeTransfer(buf, in);
+    Transfer out;
+    CHECK(DecodeTransfer(buf.data(), static_cast<uint32_t>(buf.size()), &out));
+    CHECK_EQ(out.postings[0].amount, a);
+  }
+}
+
+TEST(transfer_wire_rejects_truncation) {
+  const Transfer in = MakeTransfer(42, {{1, -50}, {2, 50}});
+  std::vector<uint8_t> buf;
+  EncodeTransfer(buf, in);
+
+  // Every proper prefix must be rejected. None of them may be mistaken for a
+  // shorter but valid transfer.
+  for (uint32_t len = 0; len < buf.size(); ++len) {
+    Transfer out;
+    CHECK(!DecodeTransfer(buf.data(), len, &out));
+  }
+  Transfer ok;
+  CHECK(DecodeTransfer(buf.data(), static_cast<uint32_t>(buf.size()), &ok));
+}
+
+TEST(transfer_wire_rejects_trailing_bytes) {
+  // A torn write can leave a valid transfer followed by stale bytes. Ignoring
+  // the tail would quietly accept that, so the length check is exact.
+  const Transfer in = MakeTransfer(42, {{1, -50}, {2, 50}});
+  std::vector<uint8_t> buf;
+  EncodeTransfer(buf, in);
+  buf.push_back(0xAB);
+  Transfer out;
+  CHECK(!DecodeTransfer(buf.data(), static_cast<uint32_t>(buf.size()), &out));
+}
+
+TEST(transfer_wire_rejects_bad_posting_count) {
+  // Hand-build headers claiming counts outside [kMinPostings, kMaxPostings].
+  // A corrupt count field must not drive a huge allocation or an over-read.
+  for (uint32_t n : {0u, 1u, 9u, 1000u, 0xFFFFFFFFu}) {
+    std::vector<uint8_t> buf;
+    for (int i = 0; i < 8; ++i) buf.push_back(0);          // idem_key
+    for (int i = 0; i < 4; ++i) buf.push_back(static_cast<uint8_t>(n >> (8 * i)));
+    buf.resize(buf.size() + 16 * 2);                        // two plausible postings
+    Transfer out;
+    CHECK(!DecodeTransfer(buf.data(), static_cast<uint32_t>(buf.size()), &out));
+  }
+}
+
+TEST(transfer_wire_is_byte_stable_little_endian) {
+  // Golden bytes: pins the format so a log written on arm64 replays on x86.
+  const Transfer in = MakeTransfer(0x0102030405060708ull,
+                                   {{0x1122334455667788ull, -2}, {1, 2}});
+  std::vector<uint8_t> buf;
+  EncodeTransfer(buf, in);
+
+  const std::vector<uint8_t> want = {
+      0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,  // key, LE
+      0x02, 0x00, 0x00, 0x00,                          // n = 2
+      0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // account
+      0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,  // -2
+      0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // account 1
+      0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // +2
+  };
+  CHECK_EQ(buf.size(), want.size());
+  CHECK(buf == want);
+}
 
 int main() {
   int failed_tests = 0;
