@@ -674,6 +674,386 @@ TEST(transfer_wire_is_byte_stable_little_endian) {
   CHECK(buf == want);
 }
 
+
+// ---------------------------------------------------------------------------
+// Steps 2 & 3: ledger domain, recovery, and the ack point
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Books |amount| into |account| from the world account.
+SubmitStatus Fund(Ledger& l, uint64_t account, int64_t amount, uint64_t key) {
+  return l.Submit({key, {{kWorldAccount, -amount}, {account, amount}}});
+}
+
+SubmitStatus Pay(Ledger& l, uint64_t from, uint64_t to, int64_t amount, uint64_t key) {
+  return l.Submit({key, {{from, -amount}, {to, amount}}});
+}
+
+// The property every durability mode is defined by: at this instant, would a
+// ledger recovered from *the platter* contain this key? Rebuilding from
+// stable_image() is exactly the check the crash campaign performs, so the ack
+// point is tested the same way it will be measured.
+bool KeyDurableNow(const SimDevice& dev, uint64_t key, bool verify_crc) {
+  SimDevice platter(dev.stable_image());
+  LedgerOptions o;
+  o.verify_crc = verify_crc;
+  Ledger recovered(platter, o);
+  return recovered.HasKey(key);
+}
+
+LedgerOptions Opts(DurabilityMode m, uint32_t group = 32, bool crc = true) {
+  LedgerOptions o;
+  o.mode = m;
+  o.group_size = group;
+  o.verify_crc = crc;
+  return o;
+}
+
+}  // namespace
+
+TEST(ledger_transfer_moves_money_and_conserves) {
+  SimDevice dev;
+  Ledger l(dev, Opts(DurabilityMode::kSyncEvery));
+
+  CHECK(Fund(l, 1, 1000, 1) == SubmitStatus::kOk);
+  CHECK(Pay(l, 1, 2, 250, 2) == SubmitStatus::kOk);
+
+  CHECK_EQ(l.Balance(1), int64_t{750});
+  CHECK_EQ(l.Balance(2), int64_t{250});
+  // The world holds the negative of all real money in the system.
+  CHECK_EQ(l.Balance(kWorldAccount), int64_t{-1000});
+  CHECK_EQ(l.TotalBalance(), int64_t{0});
+  CHECK(l.ConservationHolds());
+}
+
+TEST(ledger_multi_leg_transfer_settles_atomically) {
+  // A card payment: customer, merchant, processor, network in one event.
+  SimDevice dev;
+  Ledger l(dev, Opts(DurabilityMode::kSyncEvery));
+  CHECK(Fund(l, 1, 5000, 1) == SubmitStatus::kOk);
+
+  CHECK(l.Submit({2, {{1, -1000}, {2, 971}, {3, 25}, {4, 4}}}) == SubmitStatus::kOk);
+  CHECK_EQ(l.Balance(1), int64_t{4000});
+  CHECK_EQ(l.Balance(2), int64_t{971});
+  CHECK_EQ(l.Balance(3), int64_t{25});
+  CHECK_EQ(l.Balance(4), int64_t{4});
+  CHECK(l.ConservationHolds());
+}
+
+TEST(ledger_duplicate_key_is_a_noop) {
+  SimDevice dev;
+  Ledger l(dev, Opts(DurabilityMode::kSyncEvery));
+  CHECK(Fund(l, 1, 1000, 1) == SubmitStatus::kOk);
+
+  const uint64_t size_before = dev.Size();
+  CHECK(Fund(l, 1, 1000, 1) == SubmitStatus::kDuplicate);
+  CHECK_EQ(dev.Size(), size_before);     // nothing was logged
+  CHECK_EQ(l.Balance(1), int64_t{1000});  // and nothing was applied twice
+}
+
+TEST(ledger_insufficient_funds_rejected_and_not_logged) {
+  SimDevice dev;
+  Ledger l(dev, Opts(DurabilityMode::kSyncEvery));
+  CHECK(Fund(l, 1, 100, 1) == SubmitStatus::kOk);
+
+  const uint64_t size_before = dev.Size();
+  CHECK(Pay(l, 1, 2, 101, 2) == SubmitStatus::kInsufficientFunds);
+  CHECK_EQ(dev.Size(), size_before);
+  CHECK_EQ(l.Balance(1), int64_t{100});
+  CHECK_EQ(l.Balance(2), int64_t{0});
+  CHECK(!l.HasKey(2));  // a rejected key stays unseen, so a retry can succeed
+}
+
+TEST(ledger_world_account_may_go_negative) {
+  SimDevice dev;
+  Ledger l(dev, Opts(DurabilityMode::kSyncEvery));
+  // No funding at all: the world starts at zero and is allowed below it.
+  CHECK(Fund(l, 1, 10'000, 1) == SubmitStatus::kOk);
+  CHECK_EQ(l.Balance(kWorldAccount), int64_t{-10'000});
+  CHECK(l.ConservationHolds());
+}
+
+TEST(ledger_unbalanced_postings_never_reach_the_log) {
+  SimDevice dev;
+  Ledger l(dev, Opts(DurabilityMode::kSyncEvery));
+  const uint64_t size_before = dev.Size();
+
+  CHECK(l.Submit({1, {{1, -100}, {2, 99}}}) == SubmitStatus::kUnbalanced);
+  CHECK(l.Submit({2, {{1, -100}}}) == SubmitStatus::kBadPostingCount);
+  CHECK(l.Submit({3, {}}) == SubmitStatus::kBadPostingCount);
+  CHECK(l.Submit({4, {{1, 1}, {2, 1}, {3, 1}, {4, 1}, {5, 1},
+                      {6, 1}, {7, 1}, {8, 1}, {9, -8}}}) == SubmitStatus::kBadPostingCount);
+
+  CHECK_EQ(dev.Size(), size_before);
+  CHECK(l.ConservationHolds());
+}
+
+TEST(ledger_overflowing_postings_are_rejected) {
+  // Two amounts that wrap to a sum of zero in wrapping arithmetic must not be
+  // mistaken for a balanced transfer.
+  SimDevice dev;
+  Ledger l(dev, Opts(DurabilityMode::kSyncEvery));
+  CHECK(l.Submit({1, {{1, INT64_MAX}, {2, INT64_MAX}, {3, 2}}}) !=
+        SubmitStatus::kOk);
+  CHECK(l.ConservationHolds());
+}
+
+TEST(ledger_empty_device_recovers_to_nothing) {
+  SimDevice dev;
+  RecoveryReport r;
+  Ledger l(dev, Opts(DurabilityMode::kSyncEvery), &r);
+  CHECK_EQ(r.records_applied, uint64_t{0});
+  CHECK_EQ(r.valid_bytes, uint64_t{0});
+  CHECK(r.stop == ScanStop::kCleanEnd);
+  CHECK(!r.corruption_admitted());
+  CHECK_EQ(l.TotalBalance(), int64_t{0});
+}
+
+TEST(ledger_recovery_reproduces_state_exactly) {
+  std::vector<uint8_t> image;
+  std::map<uint64_t, int64_t> want_balances;
+  std::vector<uint64_t> want_keys;
+
+  {
+    SimDevice dev;
+    Ledger l(dev, Opts(DurabilityMode::kSyncEvery));
+    CHECK(Fund(l, 1, 1'000'000, 1) == SubmitStatus::kOk);
+    CHECK(Fund(l, 2, 1'000'000, 2) == SubmitStatus::kOk);
+    for (uint64_t k = 3; k < 40; ++k) {
+      CHECK(Pay(l, 1 + (k % 2), 2 - (k % 2), static_cast<int64_t>(k * 7), k) ==
+            SubmitStatus::kOk);
+    }
+    l.Commit();
+    want_balances = l.balances();
+    want_keys = l.applied_keys();
+    image = dev.stable_image();
+  }
+
+  SimDevice reopened(image);
+  RecoveryReport r;
+  Ledger l2(reopened, Opts(DurabilityMode::kSyncEvery), &r);
+
+  CHECK(!r.corruption_admitted());
+  CHECK(r.stop == ScanStop::kCleanEnd);
+  CHECK(l2.balances() == want_balances);   // exact state, not merely plausible
+  CHECK(l2.applied_keys() == want_keys);   // exact order
+  CHECK(l2.ConservationHolds());
+}
+
+TEST(ledger_reopened_ledger_keeps_working_and_still_dedups) {
+  std::vector<uint8_t> image;
+  {
+    SimDevice dev;
+    Ledger l(dev, Opts(DurabilityMode::kSyncEvery));
+    CHECK(Fund(l, 1, 1000, 1) == SubmitStatus::kOk);
+    CHECK(Pay(l, 1, 2, 100, 2) == SubmitStatus::kOk);
+    l.Commit();
+    image = dev.stable_image();
+  }
+
+  SimDevice dev(image);
+  Ledger l(dev, Opts(DurabilityMode::kSyncEvery));
+
+  // Dedup survived the restart, rebuilt from the log with no separate table.
+  CHECK(Pay(l, 1, 2, 100, 2) == SubmitStatus::kDuplicate);
+  CHECK_EQ(l.Balance(2), int64_t{100});
+
+  // And the reopened ledger still accepts new work, appended after the
+  // recovered prefix.
+  CHECK(Pay(l, 1, 2, 50, 3) == SubmitStatus::kOk);
+  l.Commit();
+  CHECK_EQ(l.Balance(1), int64_t{850});
+  CHECK_EQ(l.Balance(2), int64_t{150});
+  CHECK(l.ConservationHolds());
+
+  // Reopening a third time sees all three transfers.
+  SimDevice again(dev.stable_image());
+  Ledger l3(again, Opts(DurabilityMode::kSyncEvery));
+  CHECK_EQ(l3.applied_keys().size(), size_t{3});
+  CHECK_EQ(l3.Balance(2), int64_t{150});
+}
+
+TEST(ledger_truncated_tail_recovers_a_strict_prefix) {
+  SimDevice dev;
+  Ledger l(dev, Opts(DurabilityMode::kSyncEvery));
+  CHECK(Fund(l, 1, 100'000, 1) == SubmitStatus::kOk);
+  for (uint64_t k = 2; k <= 20; ++k) CHECK(Pay(l, 1, 2, 10, k) == SubmitStatus::kOk);
+  l.Commit();
+
+  const std::vector<uint8_t> full = dev.stable_image();
+
+  // Chop the log at every possible byte. Every truncation must yield a strict
+  // prefix of the key sequence -- never a phantom, never a reordering.
+  for (size_t cut = 0; cut < full.size(); cut += 7) {
+    std::vector<uint8_t> shorter(full.begin(), full.begin() + cut);
+    SimDevice d(shorter);
+    Ledger r(d, Opts(DurabilityMode::kSyncEvery));
+
+    const std::vector<uint64_t>& got = r.applied_keys();
+    CHECK(got.size() <= size_t{20});
+    for (size_t i = 0; i < got.size(); ++i) CHECK_EQ(got[i], uint64_t{i + 1});
+    CHECK(r.ConservationHolds());
+  }
+}
+
+TEST(ledger_corrupt_payload_caught_by_domain_rule_when_crc_is_off) {
+  // The torn_accepted case: the checksum layer is disabled, so a damaged
+  // payload reaches the domain layer, and an ordinary business rule is the only
+  // thing that catches it. This is why replay re-validates.
+  SimDevice dev;
+  Ledger l(dev, Opts(DurabilityMode::kSyncEvery));
+  CHECK(Fund(l, 1, 1000, 1) == SubmitStatus::kOk);
+  l.Commit();
+
+  std::vector<uint8_t> image = dev.stable_image();
+  // First record: 24-byte header, then key(8) + count(4), then the first
+  // posting's account(8) and amount(8). Break the amount so the sum is nonzero.
+  const size_t amount_off = kHeaderSize + 8 + 4 + 8;
+  CHECK(image.size() > amount_off);
+  image[amount_off] ^= 0x40;
+
+  SimDevice damaged(image);
+  RecoveryReport r;
+  Ledger recovered(damaged, Opts(DurabilityMode::kSyncEvery, 32, /*crc=*/false), &r);
+
+  CHECK(r.corruption_admitted());               // something got past the checksum
+  CHECK_EQ(r.unbalanced_in_log, uint64_t{1});   // caught by the balance rule
+  CHECK_EQ(r.records_applied, uint64_t{0});
+  CHECK(recovered.ConservationHolds());         // and we did not apply it
+}
+
+TEST(ledger_same_corruption_is_caught_by_the_checksum_when_crc_is_on) {
+  SimDevice dev;
+  Ledger l(dev, Opts(DurabilityMode::kSyncEvery));
+  CHECK(Fund(l, 1, 1000, 1) == SubmitStatus::kOk);
+  l.Commit();
+
+  std::vector<uint8_t> image = dev.stable_image();
+  image[kHeaderSize + 8 + 4 + 8] ^= 0x40;
+
+  SimDevice damaged(image);
+  RecoveryReport r;
+  Ledger recovered(damaged, Opts(DurabilityMode::kSyncEvery, 32, /*crc=*/true), &r);
+
+  CHECK(r.stop == ScanStop::kBadCrc);      // stopped one layer earlier
+  CHECK(!r.corruption_admitted());         // the domain rules never saw it
+  CHECK_EQ(r.records_applied, uint64_t{0});
+}
+
+// --- Step 3: the ack point -------------------------------------------------
+
+TEST(ack_sync_every_never_acks_before_the_platter) {
+  SimDevice dev;
+  Ledger l(dev, Opts(DurabilityMode::kSyncEvery));
+
+  int acks = 0, durable_at_ack = 0;
+  l.set_ack_sink([&](uint64_t key) {
+    ++acks;
+    if (KeyDurableNow(dev, key, true)) ++durable_at_ack;
+  });
+
+  CHECK(Fund(l, 1, 100'000, 1) == SubmitStatus::kOk);
+  for (uint64_t k = 2; k <= 30; ++k) CHECK(Pay(l, 1, 2, 10, k) == SubmitStatus::kOk);
+  l.Commit();
+
+  CHECK_EQ(acks, 30);
+  CHECK_EQ(durable_at_ack, acks);   // every single ack was already on the platter
+  CHECK_EQ(dev.sync_count(), uint64_t{30});
+}
+
+TEST(ack_group_commit_never_acks_before_the_platter) {
+  SimDevice dev;
+  const uint32_t group = 8;
+  Ledger l(dev, Opts(DurabilityMode::kGroupCommit, group));
+
+  int acks = 0, durable_at_ack = 0;
+  l.set_ack_sink([&](uint64_t key) {
+    ++acks;
+    if (KeyDurableNow(dev, key, true)) ++durable_at_ack;
+  });
+
+  CHECK(Fund(l, 1, 100'000, 1) == SubmitStatus::kOk);
+  for (uint64_t k = 2; k <= 32; ++k) CHECK(Pay(l, 1, 2, 10, k) == SubmitStatus::kOk);
+  l.Commit();
+
+  CHECK_EQ(acks, 32);
+  CHECK_EQ(durable_at_ack, acks);   // exactly as correct as sync_every...
+  // ...but at a fraction of the fsyncs: 32 records / 8 per batch = 4.
+  CHECK_EQ(dev.sync_count(), uint64_t{4});
+}
+
+TEST(ack_no_sync_acks_ahead_of_durability_and_never_fsyncs) {
+  SimDevice dev;
+  Ledger l(dev, Opts(DurabilityMode::kNoSync));
+
+  int acks = 0, durable_at_ack = 0;
+  l.set_ack_sink([&](uint64_t key) {
+    ++acks;
+    if (KeyDurableNow(dev, key, true)) ++durable_at_ack;
+  });
+
+  CHECK(Fund(l, 1, 100'000, 1) == SubmitStatus::kOk);
+  for (uint64_t k = 2; k <= 30; ++k) CHECK(Pay(l, 1, 2, 10, k) == SubmitStatus::kOk);
+  l.Commit();
+
+  CHECK_EQ(acks, 30);
+  CHECK_EQ(durable_at_ack, 0);            // not one ack was backed by the platter
+  CHECK_EQ(dev.sync_count(), uint64_t{0});  // not even on Commit()
+}
+
+TEST(ack_lazy_sync_acks_ahead_of_durability_by_up_to_n_records) {
+  // The mode that looks perfect on a machine that never loses power. The ack
+  // runs ahead of the fsync by up to group_size records, and this test pins the
+  // size of that window.
+  SimDevice dev;
+  const uint32_t n = 8;
+  Ledger l(dev, Opts(DurabilityMode::kLazySync, n));
+
+  int acks = 0, durable_at_ack = 0;
+  l.set_ack_sink([&](uint64_t key) {
+    ++acks;
+    if (KeyDurableNow(dev, key, true)) ++durable_at_ack;
+  });
+
+  CHECK(Fund(l, 1, 100'000, 1) == SubmitStatus::kOk);
+  for (uint64_t k = 2; k <= 32; ++k) CHECK(Pay(l, 1, 2, 10, k) == SubmitStatus::kOk);
+
+  CHECK_EQ(acks, 32);
+  CHECK_EQ(durable_at_ack, 0);  // the ack always precedes the sync it relies on
+  CHECK_EQ(dev.sync_count(), uint64_t{32 / n});
+}
+
+TEST(ack_durable_modes_lose_nothing_across_a_power_cut) {
+  // The campaign's headline check, in miniature: cut the power at a random
+  // moment and demand that every acknowledged key survived.
+  for (DurabilityMode mode :
+       {DurabilityMode::kSyncEvery, DurabilityMode::kGroupCommit}) {
+    for (uint64_t seed = 1; seed <= 40; ++seed) {
+      SimDevice dev;
+      Ledger l(dev, Opts(mode, 4));
+
+      std::vector<uint64_t> acked;
+      l.set_ack_sink([&](uint64_t key) { acked.push_back(key); });
+
+      CHECK(Fund(l, 1, 100'000, 1) == SubmitStatus::kOk);
+      for (uint64_t k = 2; k <= 25; ++k) CHECK(Pay(l, 1, 2, 10, k) == SubmitStatus::kOk);
+
+      std::mt19937_64 rng(seed);
+      CutPolicy policy;
+      policy.p_persist = 0.5;
+      policy.p_tear = 0.2;
+      SimDevice after(dev.PowerCut(rng, policy));
+
+      RecoveryReport r;
+      Ledger recovered(after, Opts(mode, 4), &r);
+
+      for (uint64_t key : acked) CHECK(recovered.HasKey(key));
+      CHECK(recovered.ConservationHolds());
+    }
+  }
+}
+
 int main() {
   int failed_tests = 0;
   for (const auto& t : Registry()) {
