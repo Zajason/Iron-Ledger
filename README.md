@@ -8,7 +8,7 @@ No third-party dependencies. CMake, a hand-rolled test harness, and a determinis
 cmake -B build && cmake --build build && ./build/unit_tests
 ```
 
-> **Status:** the storage core (`crc32c`, `Device`, WAL) is **complete and tested** — 22 tests, 64,026 assertions, zero warnings under `-Wall -Wextra -Wpedantic`, clean under ASan + UBSan. The ledger and the crash campaign are in progress; see [Roadmap](#roadmap). Results tables below are labelled with what is measured and what is still a prediction.
+> **Status:** the storage core (`crc32c`, `Device`, WAL) and the **ledger with all four durability modes** are complete and tested — 46 tests, 70,728 assertions, zero warnings under `-Wall -Wextra -Wpedantic`, clean under ASan + UBSan. The crash campaign is next; see [Roadmap](#roadmap). Results tables below are labelled with what is measured and what is still a prediction.
 
 ---
 
@@ -48,6 +48,17 @@ An *acknowledgement* is the moment you tell a client "this money moved." It is a
 | `lazy_sync` | ack immediately, `fsync` every N | **loses thousands — and looks perfect on any machine that never loses power** |
 | `sync_every` | `fsync`, *then* ack | zero. Correct, slow. |
 | `group_commit` | batch N, one write, one `fsync`, ack all N | zero. Correct, and amortises the `fsync`. |
+
+**The ack point is already tested directly, and this part is measured.** At the instant of every acknowledgement, the test rebuilds a ledger from `stable_image()` — the bytes that would be on the platter — and asks whether the key is there:
+
+| mode | acks backed by the platter | fsyncs for 32 records |
+|---|---|---|
+| `sync_every` | **30 / 30** | 30 |
+| `group_commit` (N=8) | **32 / 32** | **4** |
+| `lazy_sync` (N=8) | 0 / 32 | 4 |
+| `no_sync` | 0 / 30 | 0 |
+
+Group commit reaches *exactly* the durability of `sync_every` at a quarter of the fsyncs. `lazy_sync` acks ahead of its own `fsync` every single time — the window is `N` records wide, and it is the same `4` fsyncs as group commit, just spent in the wrong order relative to the promise.
 
 `lazy_sync` is the one that matters. It is fast, it passes every test you run on a healthy machine, it passes the `kill -9` campaign flawlessly, and it is the shape of an enormous number of real-world "yes, we have durability" claims. The gap between its ack and its `fsync` is real, and it is exactly N records wide.
 
@@ -151,7 +162,7 @@ cmake -B build-asan -DIL_SANITIZE=ON && cmake --build build-asan && ./build-asan
 Current output:
 
 ```
-22 tests, 64026 checks, 0 failed
+46 tests, 70728 checks, 0 failed
 ```
 
 Every trial in the campaign is seeded, so any violation replays exactly:
@@ -169,8 +180,8 @@ Every trial in the campaign is seeded, so any violation replays exactly:
 | `crc32c` — table-driven CRC-32C, RFC 3720 vectors | **done, tested** |
 | `Device` — `FileDevice` + `SimDevice` power-loss simulator | **done, tested** |
 | `wal` — record format, `ScanLog`, `LogWriter` | **done, tested** |
-| `ledger` — double-entry, four durability modes, recovery | in progress |
-| `crash_sim` — the 10,000-trial power-loss campaign | in progress |
+| `ledger` — double-entry, four durability modes, recovery | **done, tested** |
+| `crash_sim` — the 10,000-trial power-loss campaign | next |
 | `kill_driver` / `kill_worker` — the `SIGKILL` campaign | in progress |
 | `bench` — throughput and commit-latency per mode | in progress |
 | CI, committed CSVs and charts, `findings.md` | in progress |
