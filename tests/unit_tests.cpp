@@ -19,6 +19,7 @@
 #include "il/device.h"
 #include "il/ledger.h"
 #include "il/wal.h"
+#include "workload.h"
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -1052,6 +1053,76 @@ TEST(ack_durable_modes_lose_nothing_across_a_power_cut) {
       CHECK(recovered.ConservationHolds());
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Step 4: the shared deterministic workload
+// ---------------------------------------------------------------------------
+
+TEST(workload_is_deterministic_for_a_given_seed) {
+  // Pass 2 of the crash campaign replays pass 1 exactly. If this ever drifts,
+  // the crash index chosen in pass 1 means something different in pass 2 and
+  // the whole experiment quietly stops measuring what it claims to.
+  WorkloadOptions o;
+  o.seed = 12345;
+  Workload a(o), b(o);
+  for (int i = 0; i < 500; ++i) {
+    const Transfer ta = a.Next();
+    const Transfer tb = b.Next();
+    CHECK_EQ(ta.idem_key, tb.idem_key);
+    CHECK_EQ(ta.postings.size(), tb.postings.size());
+    for (size_t k = 0; k < ta.postings.size(); ++k) {
+      CHECK_EQ(ta.postings[k].account, tb.postings[k].account);
+      CHECK_EQ(ta.postings[k].amount, tb.postings[k].amount);
+    }
+  }
+
+  // A different seed must actually produce a different stream.
+  WorkloadOptions o2 = o;
+  o2.seed = 999;
+  Workload c(o2);
+  Workload d(o);
+  bool differs = false;
+  for (int i = 0; i < 500 && !differs; ++i) {
+    const Transfer tc = c.Next();
+    const Transfer td = d.Next();
+    differs = tc.postings.size() != td.postings.size() ||
+              tc.postings[0].account != td.postings[0].account ||
+              tc.postings[0].amount != td.postings[0].amount;
+  }
+  CHECK(differs);
+}
+
+TEST(workload_keys_are_dense_and_transfers_balance) {
+  WorkloadOptions o;
+  Workload w(o);
+  for (uint64_t i = 1; i <= 2000; ++i) {
+    const Transfer t = w.Next();
+    CHECK_EQ(t.idem_key, i);  // dense 1,2,3... is what makes the prefix check work
+    CHECK(t.postings.size() >= kMinPostings);
+    CHECK(t.postings.size() <= kMaxPostings);
+    int64_t sum = 0;
+    for (const Posting& p : t.postings) sum += p.amount;
+    CHECK_EQ(sum, int64_t{0});
+  }
+}
+
+TEST(workload_is_never_rejected_by_the_ledger) {
+  // The property the harnesses lean on: no transfer is ever refused, so the
+  // recovered key sequence must be exactly 1..k and a driver can verify that
+  // without asking the ledger anything.
+  SimDevice dev;
+  LedgerOptions lo;
+  lo.mode = DurabilityMode::kNoSync;  // fastest; validation is mode-independent
+  Ledger l(dev, lo);
+  Workload w{WorkloadOptions{}};
+
+  for (int i = 0; i < 5000; ++i) {
+    const SubmitStatus st = l.Submit(w.Next());
+    CHECK(st == SubmitStatus::kOk);
+  }
+  CHECK_EQ(l.applied_keys().size(), size_t{5000});
+  CHECK(l.ConservationHolds());
 }
 
 int main() {

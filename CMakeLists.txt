@@ -26,8 +26,13 @@ add_library(il STATIC
 )
 target_include_directories(il PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+add_executable(crash_sim tools/crash_sim.cpp)
+target_link_libraries(crash_sim PRIVATE il)
+target_include_directories(crash_sim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+
 enable_testing()
 
 add_executable(unit_tests tests/unit_tests.cpp)
 target_link_libraries(unit_tests PRIVATE il)
+target_include_directories(unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools)
 add_test(NAME unit_tests COMMAND unit_tests)
