@@ -8,7 +8,7 @@ No third-party dependencies. CMake, a hand-rolled test harness, and a determinis
 cmake -B build && cmake --build build && ./build/unit_tests
 ```
 
-> **Status:** the storage core (`crc32c`, `Device`, WAL) and the **ledger with all four durability modes** are complete and tested — 46 tests, 70,728 assertions, zero warnings under `-Wall -Wextra -Wpedantic`, clean under ASan + UBSan. The crash campaign is next; see [Roadmap](#roadmap). Results tables below are labelled with what is measured and what is still a prediction.
+> **Status:** the storage core, the ledger, and **the power-loss campaign are complete** — the results table below is measured, not predicted. 49 tests, 87,709 assertions, zero warnings under `-Wall -Wextra -Wpedantic`, clean under ASan + UBSan. The `SIGKILL` campaign and the benchmark are still to come; see [Roadmap](#roadmap).
 
 ---
 
@@ -25,6 +25,8 @@ The obvious way to crash-test a storage system is to kill it:
 Do that to a ledger that **never calls `fsync` at all**, and it passes. Perfect score. Zero lost transactions, hundreds of kills.
 
 That is not a bug in the harness. **That is the finding.**
+
+*(The `SIGKILL` campaign is the one piece not yet built — this claim is the prediction it exists to test, and the number goes here when it runs. The power-loss half **is** measured, below, and `no_sync` loses 79% of what it acknowledged. The gap between those two numbers is the entire point.)*
 
 `kill -9` destroys a *process*. It does not touch the **kernel page cache**. Every byte the dying process wrote is still in kernel memory, and the kernel flushes it to disk at its leisure, entirely indifferent to the fact that the process is gone. The data lands. Recovery finds it. Everything looks fine.
 
@@ -62,32 +64,43 @@ Group commit reaches *exactly* the durability of `sync_every` at a quarter of th
 
 `lazy_sync` is the one that matters. It is fast, it passes every test you run on a healthy machine, it passes the `kill -9` campaign flawlessly, and it is the shape of an enormous number of real-world "yes, we have durability" claims. The gap between its ack and its `fsync` is real, and it is exactly N records wide.
 
-### The hypothesis the campaign is built to test
+### Results: 10,000 power failures per configuration
 
-*(Predicted, not yet measured — the harness is the work in progress. These numbers get replaced with real output, and the campaign exits non-zero if the `sync_every` / `group_commit` rows are ever anything but zero, which makes the whole thing a CI regression test.)*
-
-```
-no_sync       crc=1   ACKS LOST=20003 / 21616      silent-corruption=0
-lazy_sync     crc=1   ACKS LOST=4588  / 21616      silent-corruption=0
-sync_every    crc=1   ACKS LOST=0                  silent-corruption=0
-group_commit  crc=1   ACKS LOST=0                  silent-corruption=0
-no_sync       crc=0   ACKS LOST=19945              silent-corruption=58
-lazy_sync     crc=0   ACKS LOST=4563               silent-corruption=25
-sync_every    crc=0   ACKS LOST=0                  silent-corruption=0
-group_commit  crc=0   ACKS LOST=0                  silent-corruption=33
-```
-
-**Read the last row twice.**
+Measured, reproducible in 6.7 seconds with `./build/crash_sim --trials 10000 --ops 64`:
 
 ```
-group_commit  crc=0   ACKS LOST=0        silent-corruption=33
+no_sync       crc=1   ACKS LOST=253278 / 320452   silent-corruption=0     torn-accepted=0
+lazy_sync     crc=1   ACKS LOST=18053  / 320452   silent-corruption=0     torn-accepted=0
+sync_every    crc=1   ACKS LOST=0      / 320452   silent-corruption=0     torn-accepted=0
+group_commit  crc=1   ACKS LOST=0      / 321408   silent-corruption=0     torn-accepted=0
+no_sync       crc=0   ACKS LOST=251507 / 320452   silent-corruption=1752  torn-accepted=2545
+lazy_sync     crc=0   ACKS LOST=18002  / 320452   silent-corruption=49    torn-accepted=300
+sync_every    crc=0   ACKS LOST=0      / 320452   silent-corruption=1     torn-accepted=12
+group_commit  crc=0   ACKS LOST=0      / 321408   silent-corruption=141   torn-accepted=784
 ```
 
-Group commit never loses an acknowledged transfer — every promise kept — and *still* hands you silently corrupted balances, because the records weren't checksummed. Recovery reports success. The data is wrong.
+**Durability.** `no_sync` loses **79%** of everything it promised. `lazy_sync` — the mode that looks perfect on any machine that never loses power — loses **18,053 acknowledged transfers**, 5.6%. `sync_every` and `group_commit` lose **exactly zero**, in both checksum arms. Not "few". Zero. The campaign exits non-zero if either row is ever non-zero, so this is a regression test, not a demo.
+
+**Group commit is not a compromise.** Same zero as `sync_every`, at a quarter of the fsyncs. Correctness and throughput are not in tension here; `lazy_sync` is simply the wrong optimisation, trading away the one thing you cannot recover for speed you could have had anyway.
+
+**Integrity is a different axis entirely.** Every `crc=1` row has **zero** silent corruption. Every `crc=0` row has some. Look at the bottom row:
+
+```
+group_commit  crc=0   ACKS LOST=0      silent-corruption=141
+```
+
+Group commit kept **every single promise** — and still handed back silently corrupted balances 141 times, because the records weren't checksummed. Recovery reported success. The data is wrong.
 
 > **Durability and integrity are two different problems, and fixing one does nothing for the other.** `fsync` answers *"did the bytes survive?"* Only a checksum answers *"are they the bytes I wrote?"* A system that fsyncs religiously and skips checksums will faithfully preserve your corruption forever.
 
-That single row is why the experiment crosses durability policy *with* checksums instead of testing them separately.
+**And it reaches the "correct" mode too.** `sync_every crc=0` shows one silent corruption — a case I expected to be zero. It is real and it reproduces:
+
+```bash
+./build/crash_sim --mode sync_every --crc 0 --trials 1 --ops 64 --seed 8490   # silent-corruption=1
+./build/crash_sim --mode sync_every --crc 1 --trials 1 --ops 64 --seed 8490   # clean
+```
+
+Same trial, same crash, 0 acknowledged transfers lost either way. The only difference is the checksum. The record being written when the power failed was never acknowledged, so no promise was broken — but with checksums off it parsed as a valid transfer and got replayed, and the recovered balances no longer match a clean replay of the true prefix. Perfect durability is not a defence against a torn record you never promised anything about.
 
 ---
 
@@ -162,7 +175,7 @@ cmake -B build-asan -DIL_SANITIZE=ON && cmake --build build-asan && ./build-asan
 Current output:
 
 ```
-46 tests, 70728 checks, 0 failed
+49 tests, 87709 checks, 0 failed
 ```
 
 Every trial in the campaign is seeded, so any violation replays exactly:
@@ -181,10 +194,10 @@ Every trial in the campaign is seeded, so any violation replays exactly:
 | `Device` — `FileDevice` + `SimDevice` power-loss simulator | **done, tested** |
 | `wal` — record format, `ScanLog`, `LogWriter` | **done, tested** |
 | `ledger` — double-entry, four durability modes, recovery | **done, tested** |
-| `crash_sim` — the 10,000-trial power-loss campaign | next |
-| `kill_driver` / `kill_worker` — the `SIGKILL` campaign | in progress |
-| `bench` — throughput and commit-latency per mode | in progress |
-| CI, committed CSVs and charts, `findings.md` | in progress |
+| `crash_sim` — the 10,000-trial power-loss campaign | **done, measured** |
+| `kill_driver` / `kill_worker` — the `SIGKILL` campaign | next |
+| `bench` — throughput and commit-latency per mode | pending |
+| CI, charts, `findings.md` | pending (campaign CSV committed) |
 
 ---
 
