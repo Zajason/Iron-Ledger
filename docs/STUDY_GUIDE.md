@@ -7,12 +7,14 @@ This document explains **what we are building, and why every piece of it is
 shaped the way it is**. The code is the artifact; this is the reasoning behind
 it. Read it once end to end, then keep it open while reading the source.
 
-> **Status, as of this writing.** `crc32c`, `Device` and the WAL are built and
-> tested (22 unit tests, green under ASan/UBSan). The ledger and the harnesses
-> are not written yet. Every results number quoted in Part VI is therefore the
-> **expected shape of the answer**, not a measurement — it is what we predict
-> and what the code will be checked against. This banner comes out, and the
-> numbers get replaced with real ones, once the campaign has actually run.
+> **Status, as of this writing.** The storage core, the ledger and both crash
+> campaigns are built and tested (49 unit tests, green under ASan/UBSan). The
+> numbers in Part VI have since been **measured** — see the
+> [README](../README.md) for the real table and the
+> [HANDBOOK](HANDBOOK.md) for how to reproduce it. Part VI below still shows the
+> original *prediction*, kept deliberately so you can compare it against what
+> actually happened: the shape held, the magnitudes differed, and one cell
+> (`sync_every` with checksums off) came out non-zero where zero was expected.
 
 ---
 

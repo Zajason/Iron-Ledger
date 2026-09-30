@@ -226,6 +226,8 @@ Checkpointing is the interesting omission. It is genuinely necessary in producti
 
 ## Documentation
 
+**[docs/HANDBOOK.md](docs/HANDBOOK.md)** — the operational reference: every flag on every tool, how to read the output, how to reproduce a single failing trial, the two controls that validate the fault injector, the six invariants, and the three changes that would silently destroy the experiment.
+
 **[docs/STUDY_GUIDE.md](docs/STUDY_GUIDE.md)** — a ~1,000-line ground-up walkthrough for someone who can write C++ and has taken an OS course but has never worked on financial infrastructure. Why ledgers are double-entry and event-sourced, the four places your data lives between `write()` and the platter, why a failed `fsync` cannot be retried, torn writes, and every design decision above worked through in full.
 
 ## References
