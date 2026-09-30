@@ -8,7 +8,7 @@ No third-party dependencies. CMake, a hand-rolled test harness, and a determinis
 cmake -B build && cmake --build build && ./build/unit_tests
 ```
 
-> **Status:** the storage core, the ledger, and **the power-loss campaign are complete** — the results table below is measured, not predicted. 49 tests, 87,709 assertions, zero warnings under `-Wall -Wextra -Wpedantic`, clean under ASan + UBSan. The `SIGKILL` campaign and the benchmark are still to come; see [Roadmap](#roadmap).
+> **Status:** the storage core, the ledger, and **both crash campaigns are complete** — every results table below is measured, not predicted. 49 tests, 87,709 assertions, zero warnings under `-Wall -Wextra -Wpedantic`, clean under ASan + UBSan. The `SIGKILL` campaign and the benchmark are still to come; see [Roadmap](#roadmap).
 
 ---
 
@@ -22,11 +22,11 @@ The obvious way to crash-test a storage system is to kill it:
 ./worker & sleep 0.01; kill -9 $!    # a few hundred times
 ```
 
-Do that to a ledger that **never calls `fsync` at all**, and it passes. Perfect score. Zero lost transactions, hundreds of kills.
+Do that to a ledger that **never calls `fsync` at all**, and it passes. Perfect score.
+
+Measured, 1,000 kills: **`no_sync` acknowledged 1,710,573 transfers and lost none of them.** Zero prefix violations, zero state mismatches, zero broken invariants.
 
 That is not a bug in the harness. **That is the finding.**
-
-*(The `SIGKILL` campaign is the one piece not yet built — this claim is the prediction it exists to test, and the number goes here when it runs. The power-loss half **is** measured, below, and `no_sync` loses 79% of what it acknowledged. The gap between those two numbers is the entire point.)*
 
 `kill -9` destroys a *process*. It does not touch the **kernel page cache**. Every byte the dying process wrote is still in kernel memory, and the kernel flushes it to disk at its leisure, entirely indifferent to the fact that the process is gone. The data lands. Recovery finds it. Everything looks fine.
 
@@ -34,7 +34,18 @@ That is not a bug in the harness. **That is the finding.**
 
 To lose data you have to lose the page cache, and no process can ask the kernel to do that. So this repo builds a **simulated block device** where the cache is mine to destroy — and then runs *both* campaigns, precisely so the gap between them is visible in the numbers.
 
-A great many systems that describe themselves as crash-tested have only ever been tested the first way.
+### The same ledger, the same modes, two crash models
+
+| mode | `SIGKILL` — acks lost | simulated power loss — acks lost |
+|---|---|---|
+| `no_sync` | **0** / 1,710,573 | **253,278** / 320,452 — 79% |
+| `lazy_sync` | **0** / 550,750 | **18,053** / 320,452 — 5.6% |
+| `sync_every` | 0 / 137,420 | 0 |
+| `group_commit` | 0 / 756,743 | 0 |
+
+The left column is what a `kill -9` harness tells you: *every mode is fine, ship any of them.* The right column is what happens when the machine actually loses power. **A great many systems that describe themselves as crash-tested have only ever measured the left column.**
+
+A side observation from those ack counts, which are all from the same wall-clock budget: `group_commit` acknowledged **756,743** transfers against `lazy_sync`'s **550,750**. Both fsync every 8 records, but group commit issues one device write per batch instead of one per record. So group commit is not merely the safer choice than `lazy_sync` — on this workload it is also the *faster* one. The unsafe shortcut buys nothing at all.
 
 ---
 
@@ -195,8 +206,8 @@ Every trial in the campaign is seeded, so any violation replays exactly:
 | `wal` — record format, `ScanLog`, `LogWriter` | **done, tested** |
 | `ledger` — double-entry, four durability modes, recovery | **done, tested** |
 | `crash_sim` — the 10,000-trial power-loss campaign | **done, measured** |
-| `kill_driver` / `kill_worker` — the `SIGKILL` campaign | next |
-| `bench` — throughput and commit-latency per mode | pending |
+| `kill_driver` / `kill_worker` — the `SIGKILL` campaign | **done, measured** |
+| `bench` — throughput and commit-latency per mode | next |
 | CI, charts, `findings.md` | pending (campaign CSV committed) |
 
 ---
@@ -206,6 +217,8 @@ Every trial in the campaign is seeded, so any violation replays exactly:
 Scope discipline matters more than feature count, so: no concurrency (single-threaded throughout), no checkpointing or log truncation (the log grows forever, and startup replays all of it), no `O_DIRECT`, no modelling of a real disk's internal write-cache ordering, and no cryptographic integrity — CRC-32C defends against a failing disk, not an adversary.
 
 Checkpointing is the interesting omission. It is genuinely necessary in production, and it would mean adding exactly the kind of on-disk metadata this log deliberately does not have — *"a log with no metadata has no metadata to corrupt"* is what makes recovery small enough to reason about after a power cut. That trade-off deserves its own project rather than a footnote in this one.
+
+**Results provenance.** The power-loss campaign is fully simulated and seeded, so its numbers are deterministic and reproduce identically on any machine. The `SIGKILL` campaign is not: it forks real processes against a real filesystem, so its ack *counts* depend on the host. The numbers quoted here were produced on macOS 15 (arm64, Apple clang 16) on an APFS volume. What does **not** depend on the host is the zero — process death cannot lose page-cache data on any mainstream kernel, which is the entire claim.
 
 **On benchmark numbers:** `fsync` on a container's overlayfs is dramatically cheaper than on real storage, and on macOS `fsync(2)` does not flush the drive's own write cache at all (that needs `F_FULLFSYNC`). Point `--path` at real storage or the latency figures are fiction.
 

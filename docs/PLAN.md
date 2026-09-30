@@ -14,7 +14,7 @@ number the campaign produces.
 - [x] **3.** Four durability modes + ack sink
 - [x] **4.** `tools/workload.h`
 - [x] **5.** `tools/crash_sim.cpp` — the campaign
-- [ ] **6.** `kill_driver` + `kill_worker`
+- [x] **6.** `kill_driver` + `kill_worker`
 - [ ] **7.** `tools/bench.cpp`
 - [ ] **8.** Run experiments, commit CSVs + charts
 - [ ] **9.** `findings.md`, real numbers into the docs
