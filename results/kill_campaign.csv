@@ -1,0 +1,5 @@
+mode,crc,trials,killed,acks,acks_lost,prefix_violations,state_mismatches,conservation_violations,corruption_admitted
+no_sync,1,250,250,1710573,0,0,0,0,0
+lazy_sync,1,250,250,550750,0,0,0,0,0
+sync_every,1,250,250,137420,0,0,0,0,0
+group_commit,1,250,250,756743,0,0,0,0,0

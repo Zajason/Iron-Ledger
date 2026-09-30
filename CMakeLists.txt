@@ -30,6 +30,15 @@ add_executable(crash_sim tools/crash_sim.cpp)
 target_link_libraries(crash_sim PRIVATE il)
 target_include_directories(crash_sim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools)
 
+add_executable(kill_worker tools/kill_worker.cpp)
+target_link_libraries(kill_worker PRIVATE il)
+target_include_directories(kill_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+
+add_executable(kill_driver tools/kill_driver.cpp)
+target_link_libraries(kill_driver PRIVATE il)
+target_include_directories(kill_driver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+add_dependencies(kill_driver kill_worker)
+
 enable_testing()
 
 add_executable(unit_tests tests/unit_tests.cpp)
